@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -12,6 +13,19 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 public class LiveStream {
 
     private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+    private final ClusterState cluster;
+
+    public LiveStream(ClusterState cluster) {
+        this.cluster = cluster;
+    }
+
+    /** A node that stops heartbeating triggers no publish of its own, so republish on a timer. */
+    @Scheduled(fixedRate = 3000)
+    void tick() {
+        if (!emitters.isEmpty()) {
+            publish(cluster.snapshot());
+        }
+    }
 
     public SseEmitter subscribe(List<ClusterState.Node> current) {
         SseEmitter emitter = new SseEmitter(0L);
