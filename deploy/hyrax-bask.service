@@ -1,0 +1,12 @@
+[Unit]
+Description=HYRAX node agent
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/hyrax/agent.env
+ExecStart=%h/.local/share/hyrax/venv/bin/hyrax-bask
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

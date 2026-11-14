@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Installs or upgrades hyrax-bask as a systemd user service for the current user.
+# Run on the target machine: install-agent.sh <wheel> <env-file> <unit-file>
+# The env file sets HYRAX_SERVER, HYRAX_NODE and HYRAX_AGENT_TOKEN.
+set -euo pipefail
+
+wheel=$1
+env_file=$2
+unit_file=$3
+home_dir=$HOME/.local/share/hyrax
+
+# uv rather than `python3 -m venv`, which needs the python3-venv apt package.
+# Machines without uv get a copy of the binary at $home_dir/uv.
+uv=$(command -v uv || echo "$home_dir/uv")
+if [ ! -x "$uv" ]; then
+    echo "uv not found: install it or copy the binary to $home_dir/uv" >&2
+    exit 1
+fi
+rm -rf "$home_dir/venv"
+"$uv" venv --quiet --python "$(command -v python3)" "$home_dir/venv"
+"$uv" pip install --quiet --python "$home_dir/venv/bin/python" "$wheel"
+
+mkdir -p "$HOME/.config/hyrax" "$HOME/.config/systemd/user"
+install -m 600 "$env_file" "$HOME/.config/hyrax/agent.env"
+install -m 644 "$unit_file" "$HOME/.config/systemd/user/hyrax-bask.service"
+
+systemctl --user daemon-reload
+systemctl --user enable --quiet hyrax-bask
+systemctl --user restart hyrax-bask

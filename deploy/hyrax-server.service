@@ -1,0 +1,13 @@
+# Stopgap until the control plane runs under Docker Compose.
+[Unit]
+Description=HYRAX control plane
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/hyrax/server.env
+ExecStart=/usr/bin/java -jar %h/Projects/HYRAX/server/target/hyrax-server-0.1.0.jar
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
