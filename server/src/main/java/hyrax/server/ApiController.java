@@ -2,6 +2,7 @@ package hyrax.server;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Instant;
 import java.util.List;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -24,7 +25,14 @@ public class ApiController {
     private final LiveStream stream;
     private final String agentToken;
 
-    public ApiController(ClusterState cluster, LiveStream stream, @Value("${hyrax.agent-token}") String agentToken) {
+    private final Rollups rollups;
+
+    public ApiController(
+            ClusterState cluster,
+            LiveStream stream,
+            Rollups rollups,
+            @Value("${hyrax.agent-token}") String agentToken) {
+        this.rollups = rollups;
         this.cluster = cluster;
         this.stream = stream;
         this.agentToken = agentToken;
@@ -39,6 +47,7 @@ public class ApiController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "node and gpus are required");
         }
         cluster.record(heartbeat);
+        rollups.add(heartbeat, Instant.now());
         stream.publish(cluster.snapshot());
         // No scheduler yet, so no node is asked to run or cancel anything.
         return new Heartbeat.Desired(List.of(), List.of());

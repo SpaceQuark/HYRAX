@@ -1,0 +1,19 @@
+# Postgres for the control plane. The password comes from deploy/.env.
+name: hyrax
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hyrax
+      POSTGRES_USER: hyrax
+      POSTGRES_PASSWORD: ${HYRAX_DB_PASSWORD:?set HYRAX_DB_PASSWORD in deploy/.env}
+    ports:
+      # Only the control plane on this machine talks to the database.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
