@@ -65,6 +65,17 @@ class RollupsTest {
     }
 
     @Test
+    void gpusOnConfiguredNodesAreReserved() {
+        var gpu = new Heartbeat.Gpu(0, "GPU-private", "RTX 4090", 0, 100, 24564, 40, 30.0, List.of());
+        rollups.add(new Heartbeat("node-2", "0.1.0", List.of(gpu), List.of()), MINUTE);
+        rollups.add(heartbeat(10, 1000, 900, 100), MINUTE);
+        rollups.flush(MINUTE.plusSeconds(60));
+
+        assertThat(jdbc.queryForObject("select reserved from gpu where uuid = 'GPU-private'", Boolean.class)).isTrue();
+        assertThat(jdbc.queryForObject("select reserved from gpu where uuid = 'GPU-rollup'", Boolean.class)).isFalse();
+    }
+
+    @Test
     void purgeDeletesOnlyOldRows() {
         rollups.add(heartbeat(10, 1000, 900, 100), MINUTE);
         rollups.add(heartbeat(10, 1000, 900, 100), MINUTE.plusSeconds(3600));

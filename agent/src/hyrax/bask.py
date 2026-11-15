@@ -1,4 +1,4 @@
-"""hyrax-bask: the node agent. Sends a heartbeat every few seconds, outbound only."""
+"""hyrax-bask: the node agent. Reports telemetry and runs jobs. Outbound connections only."""
 
 import argparse
 import json
@@ -6,27 +6,15 @@ import logging
 import os
 import socket
 import time
-import urllib.error
-import urllib.request
+from pathlib import Path
 
 import pynvml
 
 from . import DEFAULT_SERVER, __version__, telemetry
+from .client import ApiError, Client
+from .executor import Executor
 
 log = logging.getLogger("hyrax-bask")
-
-
-def post_heartbeat(server: str, token: str | None, body: dict, timeout: float) -> dict:
-    request = urllib.request.Request(
-        f"{server.rstrip('/')}/api/agent/heartbeat",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    if token:
-        request.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
 
 
 def main() -> None:
@@ -45,28 +33,46 @@ def main() -> None:
         print(json.dumps(telemetry.sample(), indent=2))
         return
 
+    client = Client(args.server, token, os.environ.get("HYRAX_CA"))
+    # Running commands for a server we cannot authenticate, or that cannot authenticate us, is not on offer.
+    executor = None
+    if client.secure and token:
+        home = Path(os.environ.get("HYRAX_HOME", Path.home() / ".local" / "share" / "hyrax"))
+        executor = Executor(home, client)
+    else:
+        log.warning("telemetry only: running jobs needs an https server and HYRAX_AGENT_TOKEN")
+
     log.info("node %s reporting to %s every %.0fs", args.node, args.server, args.interval)
     connected = None
     while True:
         started = time.monotonic()
+        gpus = telemetry.sample()
+        if executor:
+            executor.poll()
+            executor.upload_logs()
         body = {
             "node": args.node,
             "agentVersion": __version__,
-            "gpus": telemetry.sample(),
-            # Job attempts this agent knows about. Empty until milestone 3.
-            "attempts": [],
+            "gpus": gpus,
+            "attempts": executor.report() if executor else [],
         }
         try:
-            # The response carries desired job state; nothing to act on until milestone 3.
-            post_heartbeat(args.server, token, body, timeout=args.interval)
+            desired = client.json("POST", "/api/agent/heartbeat", body, timeout=args.interval)
             if connected is not True:
                 log.info("connected to control plane")
             connected = True
-        except (urllib.error.URLError, OSError, ValueError) as error:
-            # Log once per outage, then keep retrying quietly.
+        except (ApiError, OSError, ValueError) as error:
+            # Log once per outage, then keep retrying quietly. Running jobs carry on regardless.
             if connected is not False:
                 log.warning("control plane unreachable: %s", error)
             connected = False
+        else:
+            if executor:
+                try:
+                    executor.apply(desired or {}, gpus)
+                except Exception:
+                    # One bad command must not take telemetry down with it.
+                    log.exception("could not apply the desired state")
         time.sleep(max(0.0, args.interval - (time.monotonic() - started)))
 
 

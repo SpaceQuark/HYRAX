@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Installs or upgrades hyrax-bask as a systemd user service for the current user.
-# Run on the target machine: install-agent.sh <wheel> <env-file> <unit-file>
-# The env file sets HYRAX_SERVER, HYRAX_NODE and HYRAX_AGENT_TOKEN.
+# Run on the target machine: install-agent.sh <wheel> <env-file> <unit-file> <ca-file>
+# The env file sets HYRAX_SERVER, HYRAX_NODE and HYRAX_AGENT_TOKEN (from `hyrax admin enroll <node>`).
+# The CA file is the control plane's ca.pem; agents and the CLI trust nothing else.
 set -euo pipefail
 
 wheel=$1
 env_file=$2
 unit_file=$3
+ca_file=$4
 home_dir=$HOME/.local/share/hyrax
 
 # uv rather than `python3 -m venv`, which needs the python3-venv apt package.
@@ -22,6 +24,11 @@ rm -rf "$home_dir/venv"
 
 mkdir -p "$HOME/.config/hyrax" "$HOME/.config/systemd/user"
 install -m 600 "$env_file" "$HOME/.config/hyrax/agent.env"
+install -m 644 "$ca_file" "$HOME/.config/hyrax/ca.pem"
+echo "HYRAX_CA=$HOME/.config/hyrax/ca.pem" >> "$HOME/.config/hyrax/agent.env"
+# The CLI on this machine, same package.
+mkdir -p "$HOME/.local/bin"
+ln -sf "$home_dir/venv/bin/hyrax" "$HOME/.local/bin/hyrax"
 install -m 644 "$unit_file" "$HOME/.config/systemd/user/hyrax-bask.service"
 
 systemctl --user daemon-reload

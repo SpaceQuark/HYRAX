@@ -6,6 +6,8 @@ After=network-online.target
 EnvironmentFile=%h/.config/hyrax/agent.env
 ExecStart=%h/.local/share/hyrax/venv/bin/hyrax-bask
 Restart=always
+# Stop or restart only the agent. Its jobs run on and the next agent picks them up from its state file.
+KillMode=process
 RestartSec=5
 
 [Install]

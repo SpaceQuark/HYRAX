@@ -6,6 +6,7 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.slf4j.Logger;
@@ -63,10 +64,15 @@ public class Rollups {
     private final Map<Key, Bucket> buckets = new ConcurrentHashMap<>();
     private final JdbcTemplate jdbc;
     private final Duration retention;
+    private final Set<String> reservedNodes;
 
-    public Rollups(JdbcTemplate jdbc, @Value("${hyrax.sample-retention}") Duration retention) {
+    public Rollups(
+            JdbcTemplate jdbc,
+            @Value("${hyrax.sample-retention}") Duration retention,
+            @Value("${hyrax.reserved-nodes:}") Set<String> reservedNodes) {
         this.jdbc = jdbc;
         this.retention = retention;
+        this.reservedNodes = reservedNodes;
     }
 
     public void add(Heartbeat heartbeat, Instant at) {
@@ -104,6 +110,7 @@ public class Rollups {
     private void store(Key key, Bucket bucket) {
         synchronized (bucket) {
             Heartbeat.Gpu gpu = bucket.latest;
+            boolean reservedByConfig = reservedNodes.contains(bucket.node);
             jdbc.update("""
                     insert into node (name, agent_version, last_seen) values (?, ?, ?)
                     on conflict (name) do update set
@@ -112,12 +119,17 @@ public class Rollups {
                     """,
                     bucket.node, bucket.agentVersion, bucket.lastSample.atOffset(ZoneOffset.UTC));
             jdbc.update("""
-                    insert into gpu (uuid, node, index, name, memory_total_mb) values (?, ?, ?, ?, ?)
+                    insert into gpu (uuid, node, index, name, memory_total_mb, reserved, reason)
+                    values (?, ?, ?, ?, ?, ?, ?)
                     on conflict (uuid) do update set
                         node = excluded.node, index = excluded.index,
-                        name = excluded.name, memory_total_mb = excluded.memory_total_mb
+                        name = excluded.name, memory_total_mb = excluded.memory_total_mb,
+                        reserved = gpu.reserved or excluded.reserved,
+                        reason = coalesce(gpu.reason, excluded.reason)
                     """,
-                    key.gpuUuid(), bucket.node, gpu.index(), gpu.name(), gpu.memoryTotalMb());
+                    key.gpuUuid(), bucket.node, gpu.index(), gpu.name(), gpu.memoryTotalMb(),
+                    // Config can only add a reservation, so one set by hand in the database is never undone here.
+                    reservedByConfig, reservedByConfig ? "node is listed in hyrax.reserved-nodes" : null);
             Float utilizationAvg = bucket.utilizationSamples == 0
                     ? null
                     : (float) bucket.utilizationSum / bucket.utilizationSamples;

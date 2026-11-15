@@ -1,6 +1,6 @@
 [project]
 name = "hyrax-gpu"
-version = "0.1.0"
+version = "0.2.0"
 description = "HYRAX node agent (hyrax-bask) and CLI (hyrax)"
 requires-python = ">=3.10"
 dependencies = ["nvidia-ml-py>=12"]
