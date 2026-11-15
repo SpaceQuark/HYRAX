@@ -20,10 +20,17 @@ export interface Gpu {
   processes: GpuProcess[];
 }
 
+export interface GpuFlags {
+  reserved: boolean;
+  // Set once a process has held memory on an idle GPU for a while.
+  baskingSince: string | null;
+}
+
 export interface ClusterNode {
   node: string;
   agentVersion: string;
   lastSeen: string;
   online: boolean;
   gpus: Gpu[];
+  flags: Record<string, GpuFlags>;
 }

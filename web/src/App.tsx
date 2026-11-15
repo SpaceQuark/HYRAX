@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ClusterNode, Gpu } from "./types";
+import type { ClusterNode, Gpu, GpuFlags } from "./types";
 
 type Connection = "connecting" | "live" | "reconnecting";
 
@@ -34,12 +34,19 @@ function gib(mb: number) {
   return (mb / 1024).toFixed(1);
 }
 
-function GpuRow({ gpu }: { gpu: Gpu }) {
+function since(timestamp: string) {
+  const minutes = Math.round((Date.now() - new Date(timestamp).getTime()) / 60000);
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+function GpuRow({ gpu, flags }: { gpu: Gpu; flags?: GpuFlags }) {
   return (
     <div className="gpu">
       <div className="gpu-head">
         <span className="gpu-index">{gpu.index}</span>
         <span className="gpu-name">{gpu.name.replace(/^NVIDIA (GeForce )?/, "")}</span>
+        {flags?.reserved && <span className="tag">reserved</span>}
+        {flags?.baskingSince && <span className="tag basking">basking {since(flags.baskingSince)}</span>}
         <span className="gpu-extra">
           {gpu.temperatureC ?? "–"}°C · {gpu.powerW == null ? "–" : Math.round(gpu.powerW)} W
         </span>
@@ -88,7 +95,7 @@ function NodeCard({ node }: { node: ClusterNode }) {
         )}
       </header>
       {node.gpus.map((gpu) => (
-        <GpuRow key={gpu.uuid} gpu={gpu} />
+        <GpuRow key={gpu.uuid} gpu={gpu} flags={node.flags[gpu.uuid]} />
       ))}
     </section>
   );

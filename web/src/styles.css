@@ -217,3 +217,17 @@ h2 {
 .empty {
   color: var(--muted);
 }
+
+.tag {
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.tag.basking {
+  border-color: var(--warn);
+  color: var(--warn);
+}

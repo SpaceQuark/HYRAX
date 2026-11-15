@@ -26,13 +26,16 @@ public class ApiController {
     private final String agentToken;
 
     private final Rollups rollups;
+    private final IdleTracker idleTracker;
 
     public ApiController(
             ClusterState cluster,
             LiveStream stream,
             Rollups rollups,
+            IdleTracker idleTracker,
             @Value("${hyrax.agent-token}") String agentToken) {
         this.rollups = rollups;
+        this.idleTracker = idleTracker;
         this.cluster = cluster;
         this.stream = stream;
         this.agentToken = agentToken;
@@ -47,7 +50,9 @@ public class ApiController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "node and gpus are required");
         }
         cluster.record(heartbeat);
-        rollups.add(heartbeat, Instant.now());
+        Instant now = Instant.now();
+        rollups.add(heartbeat, now);
+        idleTracker.observe(heartbeat, now);
         stream.publish(cluster.snapshot());
         // No scheduler yet, so no node is asked to run or cancel anything.
         return new Heartbeat.Desired(List.of(), List.of());
