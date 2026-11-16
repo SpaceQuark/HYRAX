@@ -9,7 +9,6 @@ import java.util.Map;
 
 /**
  * The Slack message for an idle episode, as Block Kit structures ready to serialise.
- * The layout was worked out in tools/slack-testbench/scream_message.py; keep the two in step.
  */
 final class ScreamMessage {
 
