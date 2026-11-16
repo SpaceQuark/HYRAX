@@ -2,7 +2,7 @@
 
 ![HYRAX](hyrax.jpeg)
 
-HYRAX is a lightweight distributed GPU job orchestrator designed for small
+HYRAX (Heterogeneous Yield & Resource Allocation eXecutor) is a lightweight distributed GPU job orchestrator designed for small
 research labs with GPUs distributed across multiple workstations.
 
 It suits labs where the machines are shared workstations, not a managed
