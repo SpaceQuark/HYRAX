@@ -134,11 +134,13 @@ public class Scheduler {
             }
         }
 
-        // Best fit: the node whose chosen GPUs are the smallest that satisfy the job, so big cards stay free
-        // for jobs that need them.
+        // Among nodes that can supply the GPUs: first the one with most of the labels the job prefers (its
+        // datasets), then best fit, the node whose chosen GPUs are the smallest that satisfy the job, so big
+        // cards stay free for jobs that need them. Preference never overrides eligibility.
         String chosenNode = null;
         List<Heartbeat.Gpu> chosen = List.of();
         long chosenSize = Long.MAX_VALUE;
+        long chosenPreferred = -1;
         Map<String, List<Heartbeat.Gpu>> eligible = new LinkedHashMap<>();
         for (Verdict verdict : verdicts) {
             if (verdict.rejected() == null) {
@@ -154,10 +156,12 @@ public class Scheduler {
                     .limit(job.gpus())
                     .toList();
             long size = smallest.get(smallest.size() - 1).memoryTotalMb();
-            if (size < chosenSize) {
+            long preferred = preferredOn(job, entry.getKey(), facts).size();
+            if (preferred > chosenPreferred || (preferred == chosenPreferred && size < chosenSize)) {
                 chosenNode = entry.getKey();
                 chosen = smallest;
                 chosenSize = size;
+                chosenPreferred = preferred;
             }
         }
 
@@ -173,6 +177,12 @@ public class Scheduler {
                 entry.put("rejected", verdict.rejected());
             } else if (chosen.contains(verdict.gpu()) && verdict.node().node().equals(chosenNode)) {
                 entry.put("chosen", true);
+                if (!job.preferredLabels().isEmpty()) {
+                    List<String> has = preferredOn(job, chosenNode, facts);
+                    entry.put("note", has.isEmpty()
+                            ? "no node with a free GPU has " + String.join(", ", job.preferredLabels())
+                            : "has " + String.join(", ", has));
+                }
             } else if (eligible.get(verdict.node().node()).size() < job.gpus()) {
                 entry.put("rejected", "node has only %d eligible GPU(s), job needs %d"
                         .formatted(eligible.get(verdict.node().node()).size(), job.gpus()));
@@ -190,6 +200,11 @@ public class Scheduler {
             taken.addAll(uuids);
             log.info("Job {} assigned to {} GPU {}", job.id(), chosenNode, chosen.stream().map(Heartbeat.Gpu::index).toList());
         }
+    }
+
+    private static List<String> preferredOn(Jobs.Queued job, String node, Jobs.Facts facts) {
+        Set<String> labels = facts.labels().getOrDefault(node, Set.of());
+        return job.preferredLabels().stream().filter(labels::contains).toList();
     }
 
     private static String nodeProblem(Jobs.Queued job, ClusterState.Node node, Jobs.Facts facts) {

@@ -1,5 +1,6 @@
 """HTTP to the control plane, for both the agent and the CLI. Standard library only."""
 
+import hashlib
 import json
 import os
 import ssl
@@ -63,6 +64,37 @@ class Client:
             except (ValueError, AttributeError):
                 message = error.reason
             raise ApiError(error.code, f"{error.code} {message}") from None
+
+    def _open(self, request, timeout: float):
+        if self.token:
+            request.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            return urllib.request.urlopen(request, timeout=timeout, context=self.context)
+        except urllib.error.HTTPError as error:
+            detail = error.read()
+            try:
+                message = json.loads(detail).get("message") or error.reason
+            except (ValueError, AttributeError):
+                message = error.reason
+            raise ApiError(error.code, f"{error.code} {message}") from None
+
+    def upload(self, path: str, file_path, timeout: float = 120.0):
+        """PUTs a file without reading it into memory. Returns the parsed reply."""
+        with open(file_path, "rb") as f:
+            request = urllib.request.Request(f"{self.server}{path}", data=f, method="PUT")
+            request.add_header("Content-Type", "application/octet-stream")
+            request.add_header("Content-Length", str(os.fstat(f.fileno()).st_size))
+            with self._open(request, timeout) as response:
+                return json.loads(response.read())
+
+    def download(self, path: str, file_path, timeout: float = 120.0) -> str:
+        """GETs into a file without holding it in memory. Returns the sha256 of what arrived."""
+        digest = hashlib.sha256()
+        with self._open(urllib.request.Request(f"{self.server}{path}"), timeout) as response, open(file_path, "wb") as f:
+            for block in iter(lambda: response.read(1 << 20), b""):
+                digest.update(block)
+                f.write(block)
+        return digest.hexdigest()
 
     def json(self, method: str, path: str, body=None, timeout: float = 10.0):
         data, _ = self.request(method, path, None if body is None else json.dumps(body).encode(), timeout=timeout)

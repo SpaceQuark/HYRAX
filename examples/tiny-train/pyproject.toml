@@ -1,0 +1,6 @@
+[project]
+name = "tiny-train"
+version = "0.1.0"
+description = "A small PyTorch training run for trying HYRAX end to end"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.7"]

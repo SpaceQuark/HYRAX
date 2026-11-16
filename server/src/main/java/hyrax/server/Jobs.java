@@ -38,7 +38,13 @@ public class Jobs {
     private static final Set<String> FINAL_REPORTS = Set.of("SUCCEEDED", "FAILED", "CANCELLED", "REJECTED");
 
     public record Submit(
-            String name, List<String> command, Map<String, String> env, Integer gpus, Long vramMb, String gpuModel, String node) {}
+            String name, List<String> command, Map<String, String> env, Integer gpus, Long vramMb, String gpuModel,
+            String node, Long snapshotId, String workdir, String environment,
+            List<String> requiredLabels, List<String> preferredLabels) {}
+
+    public record Artifact(String path, long sizeBytes, String sha256) {}
+
+    public record Label(String node, String label, String path) {}
 
     public record View(
             long id,
@@ -59,16 +65,25 @@ public class Jobs {
             Instant startedAt,
             Integer exitCode,
             String reason,
-            @JsonRawValue String lastDecision) {}
+            @JsonRawValue String lastDecision,
+            String snapshotSha256,
+            String gitCommit,
+            Boolean gitDirty,
+            String workdir,
+            String environment,
+            List<String> requiredLabels,
+            List<String> preferredLabels) {}
 
-    public record Queued(long id, int gpus, Long vramMb, String gpuModel, String node, List<String> requiredLabels) {}
+    public record Queued(long id, int gpus, Long vramMb, String gpuModel, String node, List<String> requiredLabels,
+            List<String> preferredLabels) {}
 
     /** What the scheduler needs to know about GPUs and nodes beyond live telemetry. */
     public record Facts(Set<String> knownGpus, Set<String> reservedGpus, Set<String> allocatedGpus,
             Set<String> enrolledNodes, Map<String, Set<String>> labels) {}
 
     private record Live(long jobId, int attempt, String state, boolean cancelRequested, List<String> command,
-            String env, List<String> gpus) {}
+            String env, List<String> gpus, Heartbeat.Snapshot snapshot, String workdir, String environment,
+            List<String> labels) {}
 
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
@@ -87,24 +102,33 @@ public class Jobs {
 
     public long submit(long userId, Submit job) {
         return jdbc.queryForObject("""
-                insert into job (user_id, name, command, env, gpus, vram_mb, gpu_model, node)
-                values (?, ?, array(select jsonb_array_elements_text(?::jsonb)), ?::jsonb, ?, ?, ?, ?)
+                insert into job (user_id, name, command, env, gpus, vram_mb, gpu_model, node,
+                                 snapshot_id, workdir, environment, required_labels, preferred_labels)
+                values (?, ?, array(select jsonb_array_elements_text(?::jsonb)), ?::jsonb, ?, ?, ?, ?,
+                        ?, ?, ?, array(select jsonb_array_elements_text(?::jsonb)), array(select jsonb_array_elements_text(?::jsonb)))
                 returning id
                 """, Long.class,
                 userId, job.name(), write(job.command()), write(job.env() == null ? Map.of() : job.env()),
-                job.gpus() == null ? 1 : job.gpus(), job.vramMb(), job.gpuModel(), job.node());
+                job.gpus() == null ? 1 : job.gpus(), job.vramMb(), job.gpuModel(), job.node(),
+                job.snapshotId(), job.workdir() == null ? "." : job.workdir(),
+                job.environment() == null ? "none" : job.environment(),
+                write(job.requiredLabels() == null ? List.of() : job.requiredLabels()),
+                write(job.preferredLabels() == null ? List.of() : job.preferredLabels()));
     }
 
     private static final String VIEW = """
             select j.id, u.name as user_name, j.name, j.command, j.gpus, j.vram_mb, j.gpu_model, j.node as wanted_node,
                    j.state, j.submitted_at, j.finished_at, j.cancel_requested_at is not null as cancel_requested,
-                   j.last_decision::text as last_decision,
+                   j.last_decision::text as last_decision, j.workdir, j.environment,
+                   j.required_labels, j.preferred_labels,
+                   s.sha256 as snapshot_sha256, s.git_commit, s.git_dirty,
                    a.attempt, a.node as run_node, a.started_at, a.exit_code, a.reason,
                    (select array_agg(g.index order by g.index)
                       from gpu_allocation ga join gpu g on g.uuid = ga.gpu_uuid
                      where ga.job_id = a.job_id and ga.attempt = a.attempt) as gpu_indexes
               from job j
               join app_user u on u.id = j.user_id
+              left join source_snapshot s on s.id = j.snapshot_id
               left join lateral (
                    select * from job_attempt a where a.job_id = j.id order by a.attempt desc limit 1) a on true
             """;
@@ -140,11 +164,12 @@ public class Jobs {
 
     public List<Queued> queued() {
         return jdbc.query("""
-                select id, gpus, vram_mb, gpu_model, node, required_labels from job
+                select id, gpus, vram_mb, gpu_model, node, required_labels, preferred_labels from job
                  where state = 'QUEUED' order by submitted_at, id
                 """,
                 (row, index) -> new Queued(row.getLong("id"), row.getInt("gpus"), (Long) row.getObject("vram_mb"),
-                        row.getString("gpu_model"), row.getString("node"), strings(row.getArray("required_labels"))));
+                        row.getString("gpu_model"), row.getString("node"), strings(row.getArray("required_labels")),
+                        strings(row.getArray("preferred_labels"))));
     }
 
     public Facts facts() {
@@ -268,7 +293,8 @@ public class Jobs {
                     cancel.add(ref);
                 } else {
                     run.add(new Heartbeat.Run(attempt.jobId(), attempt.attempt(), attempt.command(),
-                            read(attempt.env()), attempt.gpus(), freeMaxComputeMb));
+                            read(attempt.env()), attempt.gpus(), freeMaxComputeMb, attempt.snapshot(),
+                            attempt.workdir(), attempt.environment(), datasetsOn(node, attempt.labels())));
                 }
             }
             return new Heartbeat.Desired(run, cancel, forget);
@@ -278,16 +304,34 @@ public class Jobs {
     private List<Live> liveOn(String node) {
         return jdbc.query("""
                 select a.job_id, a.attempt, a.state, j.cancel_requested_at is not null as cancel_requested,
-                       j.command, j.env::text as env,
+                       j.command, j.env::text as env, j.workdir, j.environment,
+                       j.required_labels || j.preferred_labels as labels, s.id as snapshot_id, s.sha256,
                        array(select ga.gpu_uuid from gpu_allocation ga join gpu g on g.uuid = ga.gpu_uuid
                               where ga.job_id = a.job_id and ga.attempt = a.attempt order by g.index) as gpus
                   from job_attempt a join job j on j.id = a.job_id
+                  left join source_snapshot s on s.id = j.snapshot_id
                  where a.node = ? and a.state in %s
                 """.formatted(LIVE),
                 (row, index) -> new Live(row.getLong("job_id"), row.getInt("attempt"), row.getString("state"),
                         row.getBoolean("cancel_requested"), strings(row.getArray("command")), row.getString("env"),
-                        strings(row.getArray("gpus"))),
+                        strings(row.getArray("gpus")),
+                        row.getString("sha256") == null ? null : new Heartbeat.Snapshot(row.getLong("snapshot_id"), row.getString("sha256")),
+                        row.getString("workdir"), row.getString("environment"), strings(row.getArray("labels"))),
                 node);
+    }
+
+    /** Dataset name to local path, for the job's dataset labels that this node has a path for. */
+    private Map<String, String> datasetsOn(String node, List<String> labels) {
+        Map<String, String> datasets = new HashMap<>();
+        if (labels.stream().noneMatch(label -> label.startsWith("dataset:"))) {
+            return datasets;
+        }
+        jdbc.query("select label, path from node_label where node = ? and path is not null", row -> {
+            if (labels.contains(row.getString("label")) && row.getString("label").startsWith("dataset:")) {
+                datasets.put(row.getString("label").substring("dataset:".length()), row.getString("path"));
+            }
+        }, node);
+        return datasets;
     }
 
     private void started(Heartbeat.Ref ref, Integer pid) {
@@ -372,6 +416,66 @@ public class Jobs {
         return out.toByteArray();
     }
 
+    // ---- snapshots, artifacts, labels ----
+
+    public Optional<Long> snapshotId(String sha256) {
+        return jdbc.queryForList("select id from source_snapshot where sha256 = ?", Long.class, sha256).stream().findFirst();
+    }
+
+    public long recordSnapshot(String sha256, long bytes, String gitCommit, boolean gitDirty, long userId) {
+        return jdbc.queryForObject("""
+                insert into source_snapshot (sha256, size_bytes, git_commit, git_dirty, uploaded_by) values (?, ?, ?, ?, ?)
+                on conflict (sha256) do update set sha256 = excluded.sha256
+                returning id
+                """, Long.class, sha256, bytes, gitCommit, gitDirty, userId);
+    }
+
+    /** The snapshot's hash, if this node has a live attempt of a job that uses it. Nodes get no other snapshots. */
+    public Optional<String> snapshotFor(long snapshotId, String node) {
+        return jdbc.queryForList("""
+                select s.sha256 from source_snapshot s
+                 where s.id = ? and exists (
+                       select 1 from job j join job_attempt a on a.job_id = j.id
+                        where j.snapshot_id = s.id and a.node = ? and a.state in %s)
+                """.formatted(LIVE), String.class, snapshotId, node).stream().findFirst();
+    }
+
+    public long artifactBytes(long jobId, int attempt, String exceptPath) {
+        return jdbc.queryForObject(
+                "select coalesce(sum(size_bytes), 0) from job_artifact where job_id = ? and attempt = ? and path <> ?",
+                Long.class, jobId, attempt, exceptPath);
+    }
+
+    public void recordArtifact(long jobId, int attempt, String path, long bytes, String sha256) {
+        jdbc.update("""
+                insert into job_artifact (job_id, attempt, path, size_bytes, sha256) values (?, ?, ?, ?, ?)
+                on conflict (job_id, attempt, path) do update set
+                    size_bytes = excluded.size_bytes, sha256 = excluded.sha256, uploaded_at = now()
+                """, jobId, attempt, path, bytes, sha256);
+    }
+
+    public List<Artifact> artifacts(long jobId, int attempt) {
+        return jdbc.query("select path, size_bytes, sha256 from job_artifact where job_id = ? and attempt = ? order by path",
+                (row, index) -> new Artifact(row.getString("path"), row.getLong("size_bytes"), row.getString("sha256")),
+                jobId, attempt);
+    }
+
+    public List<Label> labels() {
+        return jdbc.query("select node, label, path from node_label order by node, label",
+                (row, index) -> new Label(row.getString("node"), row.getString("label"), row.getString("path")));
+    }
+
+    public void setLabel(String node, String label, String path) {
+        jdbc.update("""
+                insert into node_label (node, label, path) values (?, ?, ?)
+                on conflict (node, label) do update set path = excluded.path
+                """, node, label, path);
+    }
+
+    public void removeLabel(String node, String label) {
+        jdbc.update("delete from node_label where node = ? and label = ?", node, label);
+    }
+
     // ---- mapping ----
 
     private static View view(ResultSet row, int index) throws SQLException {
@@ -383,7 +487,9 @@ public class Jobs {
                 (Integer) row.getObject("attempt"), row.getString("run_node"),
                 gpus == null ? List.of() : List.of((Integer[]) gpus.getArray()),
                 instant(row, "started_at"), (Integer) row.getObject("exit_code"), row.getString("reason"),
-                row.getString("last_decision"));
+                row.getString("last_decision"), row.getString("snapshot_sha256"), row.getString("git_commit"),
+                (Boolean) row.getObject("git_dirty"), row.getString("workdir"), row.getString("environment"),
+                strings(row.getArray("required_labels")), strings(row.getArray("preferred_labels")));
     }
 
     private static Instant instant(ResultSet row, String column) throws SQLException {

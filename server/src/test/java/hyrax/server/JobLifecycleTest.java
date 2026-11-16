@@ -1,7 +1,10 @@
 package hyrax.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -20,7 +23,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 
 /** Placement and the attempt state machine, driven by hand: the scheduler's own timer is parked. */
-@SpringBootTest(properties = {"hyrax.jobs.tick=1h", "hyrax.jobs.free-for=0s", "hyrax.jobs.assign-lease=30s"})
+@SpringBootTest(properties = {"hyrax.jobs.tick=1h", "hyrax.jobs.free-for=0s", "hyrax.jobs.assign-lease=30s",
+        "hyrax.data-dir=${java.io.tmpdir}/hyrax-test-data", "hyrax.artifacts.max-bytes=64"})
 @AutoConfigureMockMvc
 @Import(TestDatabase.class)
 class JobLifecycleTest {
@@ -45,9 +49,12 @@ class JobLifecycleTest {
     @BeforeEach
     void seed() {
         jdbc.update("delete from job_log_chunk");
+        jdbc.update("delete from job_artifact");
+        jdbc.update("delete from node_label");
         jdbc.update("delete from gpu_allocation");
         jdbc.update("delete from job_attempt");
         jdbc.update("delete from job");
+        jdbc.update("delete from source_snapshot");
         jdbc.update("delete from app_user");
         user = jdbc.queryForObject("insert into app_user (name, token_hash) values ('ada', ?) returning id",
                 Long.class, Auth.hash("ada-token"));
@@ -81,7 +88,8 @@ class JobLifecycleTest {
     }
 
     private long submit(Long vramMb, String node) {
-        return jobs.submit(user, new Jobs.Submit(null, List.of("python", "train.py"), Map.of("SEED", "1"), 1, vramMb, null, node));
+        return jobs.submit(user, new Jobs.Submit(null, List.of("python", "train.py"), Map.of("SEED", "1"), 1, vramMb, null, node,
+                null, null, null, null, null));
     }
 
     private Jobs.View job(long id) {
@@ -270,5 +278,109 @@ class JobLifecycleTest {
                         .contentType(MediaType.APPLICATION_JSON).content(heartbeat))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.run[0].jobId").value(id));
+    }
+
+    private static String sha256(byte[] data) throws Exception {
+        return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(data));
+    }
+
+    @Test
+    void prefersTheNodeThatHasTheDatasetButNotAtTheCostOfVram() {
+        jobs.setLabel("big", "dataset:slides", "/data/slides");
+        long fits = jobs.submit(user, new Jobs.Submit(null, List.of("python", "train.py"), null, 1, 20_000L, null, null,
+                null, null, null, null, List.of("dataset:slides")));
+        scheduler.pass(Instant.now());
+        // Best fit alone would have picked a 24 GB card on "small".
+        assertThat(job(fits).node()).isEqualTo("big");
+        assertThat(job(fits).lastDecision()).contains("has dataset:slides");
+        assertThat(jobs.reconcile("big", List.of()).run().get(0).datasets()).containsEntry("slides", "/data/slides");
+
+        // The only node with the dataset is now busy: the job still runs, elsewhere, and is told so.
+        long elsewhere = jobs.submit(user, new Jobs.Submit(null, List.of("python", "train.py"), null, 1, 20_000L, null, null,
+                null, null, null, null, List.of("dataset:slides")));
+        scheduler.pass(Instant.now());
+        assertThat(job(elsewhere).node()).isEqualTo("small");
+        assertThat(job(elsewhere).lastDecision()).contains("no node with a free GPU has dataset:slides");
+        assertThat(jobs.reconcile("small", List.of()).run().get(0).datasets()).isEmpty();
+
+        // Required is different: it waits.
+        long strict = jobs.submit(user, new Jobs.Submit(null, List.of("python", "train.py"), null, 1, null, null, null,
+                null, null, null, List.of("dataset:slides"), null));
+        scheduler.pass(Instant.now());
+        assertThat(job(strict).state()).isEqualTo("QUEUED");
+        assertThat(job(strict).lastDecision()).contains("node lacks label dataset:slides");
+    }
+
+    @Test
+    void aSnapshotIsStoredOnceCheckedAndOnlyGivenToTheNodeRunningIt() throws Exception {
+        byte[] tree = "pretend this is a tarball".getBytes();
+        String sha = sha256(tree);
+        jdbc.update("update node set agent_token_hash = ? where name = 'big'", Auth.hash("big-token"));
+        jdbc.update("update node set agent_token_hash = ? where name = 'small'", Auth.hash("small-token"));
+
+        mvc.perform(put("/api/snapshots/" + sha256("other".getBytes())).secure(true)
+                        .header("Authorization", "Bearer ada-token").content(tree))
+                .andExpect(status().isBadRequest());
+        mvc.perform(get("/api/snapshots/" + sha).secure(true).header("Authorization", "Bearer ada-token"))
+                .andExpect(status().isNotFound());
+        mvc.perform(put("/api/snapshots/" + sha + "?gitCommit=abc123&gitDirty=true").secure(true)
+                        .header("Authorization", "Bearer ada-token").content(tree))
+                .andExpect(status().isOk());
+        long snapshot = jdbc.queryForObject("select id from source_snapshot where sha256 = ?", Long.class, sha);
+
+        long id = jobs.submit(user, new Jobs.Submit(null, List.of("python", "train.py"), null, 1, null, null, "big",
+                snapshot, "experiments", "uv", null, null));
+        scheduler.pass(Instant.now());
+        Heartbeat.Run run = jobs.reconcile("big", List.of()).run().get(0);
+        assertThat(run.snapshot()).isEqualTo(new Heartbeat.Snapshot(snapshot, sha));
+        assertThat(run.workdir()).isEqualTo("experiments");
+        assertThat(run.environment()).isEqualTo("uv");
+        assertThat(job(id).gitCommit()).isEqualTo("abc123");
+        assertThat(job(id).gitDirty()).isTrue();
+
+        mvc.perform(get("/api/agent/snapshots/" + snapshot).secure(true).header("Authorization", "Bearer big-token"))
+                .andExpect(status().isOk())
+                .andExpect(content().bytes(tree));
+        mvc.perform(get("/api/agent/snapshots/" + snapshot).secure(true).header("Authorization", "Bearer small-token"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void outputsAreStoredWithChecksumsWithinALimitAndNeverOutsideTheirDirectory() throws Exception {
+        jdbc.update("update node set agent_token_hash = ? where name = 'big'", Auth.hash("big-token"));
+        long id = submit(null, "big");
+        scheduler.pass(Instant.now());
+        byte[] metrics = "{\"loss\": 0.1}".getBytes();
+        String base = "/api/agent/jobs/" + id + "/attempts/1/artifacts";
+
+        mvc.perform(put(base + "?path=run/metrics.json&sha256=" + sha256(metrics)).secure(true)
+                        .header("Authorization", "Bearer big-token").content(metrics))
+                .andExpect(status().isOk());
+        mvc.perform(put(base + "?path=../../escape&sha256=" + sha256(metrics)).secure(true)
+                        .header("Authorization", "Bearer big-token").content(metrics))
+                .andExpect(status().isBadRequest());
+        mvc.perform(put(base + "?path=/etc/passwd&sha256=" + sha256(metrics)).secure(true)
+                        .header("Authorization", "Bearer big-token").content(metrics))
+                .andExpect(status().isBadRequest());
+        mvc.perform(put(base + "?path=corrupt&sha256=" + sha256("something else".getBytes())).secure(true)
+                        .header("Authorization", "Bearer big-token").content(metrics))
+                .andExpect(status().isBadRequest());
+        // The test limit is 64 bytes per attempt.
+        mvc.perform(put(base + "?path=huge.bin&sha256=" + sha256(new byte[100])).secure(true)
+                        .header("Authorization", "Bearer big-token").content(new byte[100]))
+                .andExpect(status().isPayloadTooLarge());
+
+        mvc.perform(get("/api/jobs/" + id + "/artifacts").secure(true).header("Authorization", "Bearer ada-token"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.files.length()").value(1))
+                .andExpect(jsonPath("$.files[0].path").value("run/metrics.json"))
+                .andExpect(jsonPath("$.files[0].sha256").value(sha256(metrics)));
+        mvc.perform(get("/api/jobs/" + id + "/artifacts/file?path=run/metrics.json").secure(true)
+                        .header("Authorization", "Bearer ada-token"))
+                .andExpect(status().isOk())
+                .andExpect(content().bytes(metrics));
+        mvc.perform(get("/api/jobs/" + id + "/artifacts/file?path=../../../etc/passwd").secure(true)
+                        .header("Authorization", "Bearer ada-token"))
+                .andExpect(status().isNotFound());
     }
 }

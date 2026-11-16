@@ -1,6 +1,6 @@
 [project]
 name = "hyrax-gpu"
-version = "0.2.0"
+version = "0.3.0"
 description = "HYRAX node agent (hyrax-bask) and CLI (hyrax)"
 requires-python = ">=3.10"
 dependencies = ["nvidia-ml-py>=12"]
@@ -8,6 +8,12 @@ dependencies = ["nvidia-ml-py>=12"]
 [project.scripts]
 hyrax = "hyrax.cli:main"
 hyrax-bask = "hyrax.bask:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]

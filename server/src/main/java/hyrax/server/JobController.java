@@ -1,19 +1,27 @@
 package hyrax.server;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import jakarta.servlet.http.HttpServletRequest;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -28,16 +36,33 @@ public class JobController {
 
     public record NewUser(String name, boolean admin) {}
 
+    public record NewLabel(String label, String path) {}
+
+    public record Artifacts(long jobId, Integer attempt, List<Jobs.Artifact> files) {}
+
     private final Auth auth;
     private final Jobs jobs;
+    private final Storage storage;
     private final JdbcTemplate jdbc;
     private final long maxLogBytes;
+    private final long maxSnapshotBytes;
+    private final long maxArtifactBytes;
 
-    public JobController(Auth auth, Jobs jobs, JdbcTemplate jdbc, @Value("${hyrax.jobs.max-log-bytes}") long maxLogBytes) {
+    public JobController(
+            Auth auth,
+            Jobs jobs,
+            Storage storage,
+            JdbcTemplate jdbc,
+            @Value("${hyrax.jobs.max-log-bytes}") long maxLogBytes,
+            @Value("${hyrax.snapshots.max-bytes}") long maxSnapshotBytes,
+            @Value("${hyrax.artifacts.max-bytes}") long maxArtifactBytes) {
         this.auth = auth;
         this.jobs = jobs;
+        this.storage = storage;
         this.jdbc = jdbc;
         this.maxLogBytes = maxLogBytes;
+        this.maxSnapshotBytes = maxSnapshotBytes;
+        this.maxArtifactBytes = maxArtifactBytes;
     }
 
     @PostMapping("/jobs")
@@ -55,11 +80,154 @@ public class JobController {
         if (job.vramMb() != null && job.vramMb() < 1) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "vramMb must be positive");
         }
+        if (job.environment() != null && !Set.of("none", "uv").contains(job.environment())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "environment must be none or uv");
+        }
+        if ("uv".equals(job.environment()) && job.snapshotId() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "a uv environment needs a source snapshot");
+        }
+        String workdir = job.workdir() == null ? "." : job.workdir();
+        if (workdir.startsWith("/") || List.of(workdir.split("/")).contains("..")) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "workdir must be a path inside the snapshot");
+        }
         try {
             return jobs.find(jobs.submit(user.id(), job)).orElseThrow();
         } catch (DataIntegrityViolationException error) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "unknown node " + job.node());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "unknown node or snapshot");
         }
+    }
+
+    // ---- source snapshots ----
+
+    /** Lets the CLI skip the upload when the server already has this exact tree. */
+    @GetMapping("/snapshots/{sha256}")
+    public Map<String, Long> findSnapshot(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable String sha256,
+            HttpServletRequest request) {
+        auth.requireUser(authorization, request);
+        Long id = jobs.snapshotId(sha256)
+                .filter(found -> Files.exists(storage.snapshot(sha256)))
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "no such snapshot"));
+        return Map.of("id", id);
+    }
+
+    @PutMapping("/snapshots/{sha256}")
+    public Map<String, Long> uploadSnapshot(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable String sha256,
+            @RequestParam(required = false) String gitCommit,
+            @RequestParam(defaultValue = "false") boolean gitDirty,
+            HttpServletRequest request) throws IOException {
+        Auth.User user = auth.requireUser(authorization, request);
+        Storage.Stored stored = storage.write(request.getInputStream(), storage.snapshot(sha256), maxSnapshotBytes, sha256);
+        return Map.of("id", jobs.recordSnapshot(sha256, stored.bytes(), gitCommit, gitDirty, user.id()));
+    }
+
+    /** For agents: the snapshot of a job this node is running, and no other. */
+    @GetMapping("/agent/snapshots/{id}")
+    public ResponseEntity<Resource> downloadSnapshot(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable long id,
+            HttpServletRequest request) {
+        String node = auth.requireEnrolledNode(authorization, request);
+        String sha256 = jobs.snapshotFor(id, node)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "no such snapshot for this node"));
+        return file(storage.snapshot(sha256));
+    }
+
+    // ---- job outputs ----
+
+    /** One file from the attempt's output directory. Uploading it again replaces it. */
+    @PutMapping("/agent/jobs/{id}/attempts/{attempt}/artifacts")
+    public Map<String, Long> uploadArtifact(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable long id,
+            @PathVariable int attempt,
+            @RequestParam String path,
+            @RequestParam String sha256,
+            HttpServletRequest request) throws IOException {
+        String node = auth.requireEnrolledNode(authorization, request);
+        if (!jobs.attemptIsOn(id, attempt, node)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "no such attempt on this node");
+        }
+        long room = maxArtifactBytes - jobs.artifactBytes(id, attempt, path);
+        Storage.Stored stored = storage.write(request.getInputStream(), storage.artifact(id, attempt, path), room, sha256);
+        jobs.recordArtifact(id, attempt, path, stored.bytes(), stored.sha256());
+        return Map.of("bytes", stored.bytes());
+    }
+
+    /** The manifest of the job's latest attempt: every output file with its size and hash. */
+    @GetMapping("/jobs/{id}/artifacts")
+    public Artifacts artifacts(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable long id,
+            HttpServletRequest request) {
+        auth.requireUser(authorization, request);
+        Jobs.View job = find(id);
+        return new Artifacts(id, job.attempt(), job.attempt() == null ? List.of() : jobs.artifacts(id, job.attempt()));
+    }
+
+    @GetMapping("/jobs/{id}/artifacts/file")
+    public ResponseEntity<Resource> artifact(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable long id,
+            @RequestParam String path,
+            HttpServletRequest request) {
+        auth.requireUser(authorization, request);
+        Jobs.View job = find(id);
+        if (job.attempt() == null || jobs.artifacts(id, job.attempt()).stream().noneMatch(file -> file.path().equals(path))) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "no such output");
+        }
+        return file(storage.artifact(id, job.attempt(), path));
+    }
+
+    private static ResponseEntity<Resource> file(Path path) {
+        if (!Files.isRegularFile(path)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "the file is no longer stored");
+        }
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_OCTET_STREAM).body(new FileSystemResource(path));
+    }
+
+    // ---- labels ----
+
+    @GetMapping("/labels")
+    public List<Jobs.Label> labels(
+            @RequestHeader(value = "Authorization", required = false) String authorization, HttpServletRequest request) {
+        auth.requireUser(authorization, request);
+        return jobs.labels();
+    }
+
+    /** Says what a node has locally, e.g. label {@code dataset:camelyon16} at path {@code /data/camelyon16}. */
+    @PutMapping("/admin/nodes/{node}/labels")
+    public Jobs.Label setLabel(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable String node,
+            @RequestBody NewLabel label,
+            HttpServletRequest request) {
+        auth.requireAdmin(authorization, request);
+        if (label.label() == null || !label.label().matches("[a-z]+:[A-Za-z0-9._-]+")) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "a label looks like dataset:name");
+        }
+        if (label.path() != null && !label.path().startsWith("/")) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "the path must be absolute");
+        }
+        try {
+            jobs.setLabel(node, label.label(), label.path());
+        } catch (DataIntegrityViolationException error) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "unknown node " + node);
+        }
+        return new Jobs.Label(node, label.label(), label.path());
+    }
+
+    @DeleteMapping("/admin/nodes/{node}/labels")
+    public void removeLabel(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable String node,
+            @RequestParam String label,
+            HttpServletRequest request) {
+        auth.requireAdmin(authorization, request);
+        jobs.removeLabel(node, label);
     }
 
     @GetMapping("/jobs")

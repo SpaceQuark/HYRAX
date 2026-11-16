@@ -2,11 +2,16 @@
 
 import argparse
 import json
+import os
 import socket
 import sys
+import tempfile
 import time
+import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
 
+from . import snapshot
 from .client import ApiError, Client, settings
 
 ACTIVE = ("QUEUED", "ASSIGNED", "RUNNING", "LOST")
@@ -59,15 +64,64 @@ def run(client: Client, args) -> int:
     node = args.node
     if args.local:
         node = settings().get("HYRAX_NODE") or socket.gethostname()
+    try:
+        source = None if args.no_snapshot else upload_snapshot(client, Path.cwd(), args.max_file_mb * 1024 * 1024)
+    except snapshot.SnapshotError as error:
+        print(f"hyrax run: {error}", file=sys.stderr)
+        return 2
+    environment = "none"
+    if source and source["uv"] and not args.no_env:
+        environment = "uv"
+        print("Environment: uv sync --locked in a virtual environment made for this job.", file=sys.stderr)
     job = client.json("POST", "/api/jobs", {
         "name": args.name, "command": command, "env": env,
         "vramMb": args.vram, "gpuModel": args.gpu_model, "node": node,
+        "snapshotId": source and source["id"], "workdir": source["workdir"] if source else ".",
+        "environment": environment,
+        "preferredLabels": [f"dataset:{name}" for name in args.dataset],
+        "requiredLabels": [f"dataset:{name}" for name in args.require_dataset],
     })
     where = f"pinned to {node}" if node else "any node with a suitable free GPU"
     print(f"Submitted job {job['id']} ({where}).", file=sys.stderr)
     if not args.follow:
         return 0
     return follow(client, job["id"])
+
+
+def upload_snapshot(client: Client, cwd: Path, max_file_bytes: int) -> dict | None:
+    """Packs the project around `cwd` and makes sure the server has it. None when there is no project."""
+    root = snapshot.find_root(cwd)
+    if root is None:
+        print("No source snapshot: this is neither a git repository nor a directory with a pyproject.toml. "
+              "The command must already exist on the node that runs it.", file=sys.stderr)
+        return None
+    files, skipped = snapshot.collect(root, max_file_bytes)
+    commit, dirty = snapshot.git_state(root)
+    with tempfile.TemporaryDirectory() as scratch:
+        archive = Path(scratch) / "snapshot.tar.gz"
+        sha256 = snapshot.pack(root, files, archive)
+        size = archive.stat().st_size
+        try:
+            found = client.json("GET", f"/api/snapshots/{sha256}")
+            where = "already on the server"
+        except ApiError as error:
+            if error.status != 404:
+                raise
+            query = urllib.parse.urlencode({"gitDirty": "true" if dirty else "false", **({"gitCommit": commit} if commit else {})})
+            found = client.upload(f"/api/snapshots/{sha256}?{query}", archive)
+            where = "uploaded"
+    revision = "not a git repository" if commit is None else f"commit {commit[:10]}" + (" plus uncommitted changes" if dirty else "")
+    print(f"Snapshot {sha256[:12]}: {len(files)} files from {root}, {size / 1024:.0f} KiB, {revision} ({where}).", file=sys.stderr)
+    for path, why in skipped[:8]:
+        print(f"  left out: {path} ({why})", file=sys.stderr)
+    if len(skipped) > 8:
+        print(f"  left out: {len(skipped) - 8} more", file=sys.stderr)
+    workdir = cwd.resolve().relative_to(root.resolve()).as_posix()
+    # uv looks for the project upwards from where the command runs, so the lockfile may be in a parent.
+    project = next((d for d in [cwd.resolve(), *cwd.resolve().parents] if (d / "uv.lock").exists()
+                    and (d / "pyproject.toml").exists() and (d == root.resolve() or root.resolve() in d.parents)), None)
+    locked = project is not None and project.relative_to(root.resolve()).joinpath("uv.lock").as_posix() in files
+    return {"id": found["id"], "workdir": workdir, "uv": locked}
 
 
 def age(timestamp: str | None) -> str:
@@ -105,7 +159,16 @@ def describe(job: dict) -> int:
     if job["gpuModel"]:
         wants.append(f"model {job['gpuModel']}")
     wants.append(f"on {job['wantedNode']}" if job["wantedNode"] else "on any node")
+    if job["requiredLabels"]:
+        wants.append("needs " + ", ".join(job["requiredLabels"]))
+    if job["preferredLabels"]:
+        wants.append("prefers " + ", ".join(job["preferredLabels"]))
     print(f"  wants:   {', '.join(wants)}")
+    if job["snapshotSha256"]:
+        revision = "no git commit" if not job["gitCommit"] else (
+            f"commit {job['gitCommit'][:10]}" + (" plus uncommitted changes" if job["gitDirty"] else ""))
+        print(f"  source:  snapshot {job['snapshotSha256'][:12]}, {revision}, run in {job['workdir']}"
+              + (", uv environment" if job["environment"] == "uv" else ""))
     if job["attempt"]:
         gpus = ",".join(str(index) for index in job["gpuIndexes"])
         print(f"  attempt: {job['attempt']} on {job['node']} GPU {gpus}"
@@ -117,6 +180,8 @@ def describe(job: dict) -> int:
         for entry in job["lastDecision"]:
             gpu = f" GPU {entry['gpu']}" if "gpu" in entry else ""
             verdict = "chosen" if entry.get("chosen") else entry.get("rejected", "eligible, not needed")
+            if entry.get("note"):
+                verdict += f" ({entry['note']})"
             print(f"    {entry['node']}{gpu}: {verdict}")
     return 0
 
@@ -152,6 +217,58 @@ def follow(client: Client, job_id: int, wait: bool = True) -> int:
     return job["exitCode"] if job["exitCode"] and job["exitCode"] > 0 else 1
 
 
+def fetch(client: Client, args) -> int:
+    """Downloads what a job left behind: its output files, checked against the manifest, its log and its record."""
+    job = client.json("GET", f"/api/jobs/{args.job}")
+    manifest = client.json("GET", f"/api/jobs/{args.job}/artifacts")
+    if job["state"] in ACTIVE:
+        print(f"hyrax fetch: job {args.job} is {job['state']}; its outputs are uploaded when it ends.", file=sys.stderr)
+        return 1
+    target = Path(args.output or f"hyrax-job-{args.job}")
+    outputs = target / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    bad, total = [], 0
+    for entry in manifest["files"]:
+        try:
+            # The manifest comes over the network: a path in it is never trusted to stay inside the target.
+            destination = snapshot.safe_join(outputs, entry["path"])
+        except snapshot.SnapshotError as error:
+            bad.append(str(error))
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(destination.name + ".part")
+        arrived = client.download(f"/api/jobs/{args.job}/artifacts/file?{urllib.parse.urlencode({'path': entry['path']})}", partial)
+        if arrived != entry["sha256"]:
+            partial.unlink()
+            bad.append(f"{entry['path']}: checksum mismatch")
+            continue
+        os.replace(partial, destination)
+        total += entry["sizeBytes"]
+    with open(target / "output.log", "wb") as log:
+        offset = 0
+        while True:
+            data, headers = client.request("GET", f"/api/jobs/{args.job}/logs?offset={offset}")
+            if not data:
+                break
+            log.write(data)
+            offset = int(headers["X-Hyrax-Next-Offset"])
+    (target / "job.json").write_text(json.dumps({"job": job, "outputs": manifest["files"]}, indent=2) + "\n")
+    print(f"Job {args.job} ({job['state']}): {len(manifest['files']) - len(bad)} output file(s), "
+          f"{total / (1024 * 1024):.1f} MiB, verified, in {outputs}/. Log and record in {target}/.")
+    for problem in bad:
+        print(f"hyrax fetch: {problem}", file=sys.stderr)
+    return 1 if bad else 0
+
+
+def labels(client: Client, args) -> int:
+    found = client.json("GET", "/api/labels")
+    if not found:
+        print("No labels. An admin adds one with: hyrax admin label <node> dataset:<name>=/path/on/that/node")
+    for entry in found:
+        print(f"{entry['node']:<14} {entry['label']:<28} {entry['path'] or ''}")
+    return 0
+
+
 def logs(client: Client, args) -> int:
     return follow(client, args.job, wait=args.follow)
 
@@ -166,6 +283,16 @@ def cancel(client: Client, args) -> int:
 
 
 def admin(client: Client, args) -> int:
+    if args.action in ("label", "unlabel"):
+        if not args.label:
+            print(f"hyrax admin {args.action}: give a label, e.g. dataset:camelyon16=/data/camelyon16", file=sys.stderr)
+            return 2
+        label, _, path = args.label.partition("=")
+        if args.action == "label":
+            client.json("PUT", f"/api/admin/nodes/{args.name}/labels", {"label": label, "path": path or None})
+        else:
+            client.request("DELETE", f"/api/admin/nodes/{args.name}/labels?{urllib.parse.urlencode({'label': label})}")
+        return 0
     if args.action == "add-user":
         created = client.json("POST", "/api/admin/users", {"name": args.name, "admin": args.admin})
     else:
@@ -189,6 +316,15 @@ def main() -> None:
     where.add_argument("--node", help="run on this node only")
     where.add_argument("--local", action="store_true", help="run on this machine only")
     run_parser.add_argument("--name")
+    run_parser.add_argument("--dataset", action="append", default=[], metavar="NAME",
+                            help="prefer a node that has this dataset; its path arrives in HYRAX_DATASET_<NAME>")
+    run_parser.add_argument("--require-dataset", action="append", default=[], metavar="NAME",
+                            help="only run on a node that has this dataset")
+    run_parser.add_argument("--no-snapshot", action="store_true",
+                            help="do not send this project's source; the command must exist on the node")
+    run_parser.add_argument("--no-env", action="store_true", help="do not build a uv environment from uv.lock")
+    run_parser.add_argument("--max-file-mb", type=int, default=50, metavar="MB",
+                            help="leave files larger than this out of the snapshot (default 50)")
     run_parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     run_parser.add_argument("-f", "--follow", action="store_true", help="print the output and wait for the job")
     run_parser.add_argument("command", nargs=argparse.REMAINDER, help="the command, after --")
@@ -204,13 +340,21 @@ def main() -> None:
     logs_parser.add_argument("-f", "--follow", action="store_true", help="keep printing until the job ends")
     logs_parser.set_defaults(handler=logs)
 
+    fetch_parser = commands.add_parser("fetch", help="download a finished job's output files, log and record")
+    fetch_parser.add_argument("job", type=int)
+    fetch_parser.add_argument("-o", "--output", metavar="DIR", help="where to put them (default hyrax-job-<id>)")
+    fetch_parser.set_defaults(handler=fetch)
+
+    commands.add_parser("labels", help="list what each node has locally, such as datasets").set_defaults(handler=labels)
+
     cancel_parser = commands.add_parser("cancel", help="stop a job")
     cancel_parser.add_argument("job", type=int)
     cancel_parser.set_defaults(handler=cancel)
 
-    admin_parser = commands.add_parser("admin", help="create users and enroll nodes; prints the new token")
-    admin_parser.add_argument("action", choices=["add-user", "enroll"])
+    admin_parser = commands.add_parser("admin", help="create users, enroll nodes (both print the new token), label nodes")
+    admin_parser.add_argument("action", choices=["add-user", "enroll", "label", "unlabel"])
     admin_parser.add_argument("name", help="user name, or node name")
+    admin_parser.add_argument("label", nargs="?", help="with label/unlabel: dataset:<name>[=/path/on/the/node]")
     admin_parser.add_argument("--admin", action="store_true", help="with add-user: make the user an admin")
     admin_parser.set_defaults(handler=admin)
 

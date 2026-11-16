@@ -8,13 +8,17 @@ written to a state file before the process exists, so a restarted agent picks it
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 from pathlib import Path
 
+from . import snapshot
 from .client import ApiError
 
 log = logging.getLogger("hyrax-bask")
@@ -33,6 +37,17 @@ def start_ticks(pid: int) -> int | None:
     return None if fields[0] == "Z" else int(fields[19])
 
 
+def find_uv() -> str | None:
+    """uv is not on a systemd service's PATH, so the usual install locations are tried as well."""
+    candidates = [shutil.which("uv"), Path.home() / ".local/bin/uv", Path.home() / ".cargo/bin/uv",
+                  Path.home() / ".local/share/hyrax/uv"]
+    return next((str(path) for path in candidates if path and os.access(path, os.X_OK)), None)
+
+
+class PrepareError(Exception):
+    pass
+
+
 class Executor:
     def __init__(self, home: Path, client, grace: float = 10.0):
         self.client = client
@@ -45,6 +60,11 @@ class Executor:
         # Log upload progress. Kept in memory: the control plane says where to resume.
         self.uploaded: dict[str, int] = {}
         self.log_done: set[str] = set()
+        # Output upload runs in threads so that a large checkpoint never delays a heartbeat. The threads
+        # only add to these two; the main loop copies the result into the state file.
+        self.outputs_done: set[str] = set()
+        self.output_notes: dict[str, list[str]] = {}
+        self.uploading: set[str] = set()
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._load()
 
@@ -80,12 +100,12 @@ class Executor:
     # ---- one tick ----
 
     def report(self) -> list[dict]:
-        """Attempts for the heartbeat. A finished attempt stays RUNNING until its output is uploaded,
-        so the control plane never shows a job as done with half a log."""
+        """Attempts for the heartbeat. A finished attempt stays RUNNING until its log and its output files
+        are uploaded, so the control plane never shows a job as done with half of what it produced."""
         reported = []
         for key, record in self.attempts.items():
             state = record["state"]
-            if state in FINAL and record.get("dir") and key not in self.log_done:
+            if state in FINAL and record.get("dir") and (key not in self.log_done or not record.get("outputsDone")):
                 state = "RUNNING"
             reported.append({
                 "jobId": record["jobId"], "attempt": record["attempt"], "state": state, "pid": record.get("pid"),
@@ -107,6 +127,8 @@ class Executor:
         """Notices attempts that have ended, and escalates cancels that SIGTERM did not finish."""
         changed = False
         for key, record in self.attempts.items():
+            if record["state"] in FINAL and record.get("dir") and not record.get("outputsDone"):
+                changed |= self._collect_outputs(key, record)
             if record["state"] != "RUNNING":
                 continue
             if self._alive(key, record):
@@ -130,12 +152,59 @@ class Executor:
                 record.update(state="CANCELLED", exitCode=code)
             elif code is None:
                 record.update(state="FAILED", reason="the process vanished without an exit status (killed, or the machine rebooted)")
+            elif (Path(record["dir"]) / "failed_stage").exists():
+                record.update(state="FAILED", exitCode=code,
+                              reason=(Path(record["dir"]) / "failed_stage").read_text() + " failed; see the log")
             else:
                 record.update(state="SUCCEEDED" if code == 0 else "FAILED", exitCode=code)
             log.info("attempt %s ended: %s (exit %s)", key, record["state"], code)
             changed = True
         if changed:
             self._save()
+
+    def _collect_outputs(self, key: str, record: dict) -> bool:
+        """Starts the upload of a finished attempt's output files, or records that it has completed."""
+        if key in self.outputs_done:
+            notes = self.output_notes.pop(key, [])
+            if notes:
+                problem = f"{len(notes)} output file(s) were not stored: " + "; ".join(notes[:3])
+                record["reason"] = f"{record['reason']}; {problem}" if record.get("reason") else problem
+            record["outputsDone"] = True
+            self.outputs_done.discard(key)
+            self.uploading.discard(key)
+            return True
+        if key not in self.uploading:
+            self.uploading.add(key)
+            threading.Thread(target=self._upload_outputs, args=(key, dict(record)), daemon=True).start()
+        return False
+
+    def _upload_outputs(self, key: str, record: dict) -> None:
+        outputs = Path(record["dir"]) / "outputs"
+        base = f"/api/agent/jobs/{record['jobId']}/attempts/{record['attempt']}/artifacts"
+        notes = []
+        for path in sorted(outputs.rglob("*")) if outputs.is_dir() else []:
+            # Regular files only. A symlink could point at anything this account can read.
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(outputs).as_posix()
+            while True:
+                try:
+                    query = urllib.parse.urlencode({"path": relative, "sha256": snapshot.sha256_of(path)})
+                    self.client.upload(f"{base}?{query}", path, timeout=600)
+                except ApiError as error:
+                    notes.append(f"{relative} ({error})")
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    # The control plane is away. The outputs wait here until it is back.
+                    log.warning("could not upload %s of %s, retrying: %s", relative, key, error)
+                    time.sleep(5)
+                    continue
+                break
+        if notes:
+            log.warning("outputs of %s not stored: %s", key, "; ".join(notes))
+        self.output_notes[key] = notes
+        self.outputs_done.add(key)
 
     def upload_logs(self) -> None:
         for key, record in self.attempts.items():
@@ -198,25 +267,38 @@ class Executor:
 
         directory = self.jobs_dir / f"{job}-{attempt}"
         shutil.rmtree(directory, ignore_errors=True)
-        directory.mkdir(parents=True)
-        (directory / "spec.json").write_text(json.dumps({"command": run["command"]}))
-        # The agent's credential stays with the agent.
-        env = {k: v for k, v in os.environ.items() if k not in ("HYRAX_AGENT_TOKEN", "HYRAX_TOKEN")}
-        env.update(run.get("env") or {})
-        env.update(
-            CUDA_VISIBLE_DEVICES=",".join(run["gpus"]),
-            HYRAX_JOB_ID=str(job),
-            HYRAX_ATTEMPT=str(attempt),
-            PYTHONUNBUFFERED="1",
-        )
+        (directory / "outputs").mkdir(parents=True)
         record = {"jobId": job, "attempt": attempt, "state": "STARTING", "dir": str(directory), "gpus": run["gpus"]}
         self.attempts[key] = record
         self.generations[str(job)] = attempt
         self._save()
         try:
+            spec = self._prepare(run, directory)
+        except (PrepareError, snapshot.SnapshotError, ApiError, OSError) as error:
+            # Not REJECTED: that would requeue the job, and it would fail the same way everywhere.
+            log.warning("could not prepare attempt %s: %s", key, error)
+            (directory / "output.log").write_text(f"hyrax: {error}\n")
+            record.update(state="FAILED", reason=f"could not prepare the job: {error}")
+            self._save()
+            return
+        (directory / "spec.json").write_text(json.dumps(spec))
+        # The agent's credential stays with the agent.
+        env = {k: v for k, v in os.environ.items() if k not in ("HYRAX_AGENT_TOKEN", "HYRAX_TOKEN")}
+        env.update(run.get("env") or {})
+        for name, path in (run.get("datasets") or {}).items():
+            env["HYRAX_DATASET_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper()] = path
+        env.update(
+            CUDA_VISIBLE_DEVICES=",".join(run["gpus"]),
+            HYRAX_JOB_ID=str(job),
+            HYRAX_ATTEMPT=str(attempt),
+            # Whatever the job writes here is uploaded when it ends, and `hyrax fetch` brings it back.
+            HYRAX_OUTPUT_DIR=str(directory / "outputs"),
+            PYTHONUNBUFFERED="1",
+        )
+        try:
             child = subprocess.Popen(
                 [sys.executable, "-m", "hyrax.runner", str(directory)],
-                cwd=directory, env=env, start_new_session=True,
+                cwd=directory, env=env, start_new_session=True,  # the runner changes into the job's own cwd
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except OSError as error:
@@ -226,6 +308,29 @@ class Executor:
             record.update(state="RUNNING", pid=child.pid, ticks=start_ticks(child.pid))
             log.info("started attempt %s as pid %d on %s: %s", key, child.pid, run["gpus"], run["command"])
         self._save()
+
+    def _prepare(self, run: dict, directory: Path) -> dict:
+        """Fetches and unpacks the job's source, and works out where and how the command runs."""
+        spec = {"command": run["command"], "cwd": str(directory), "setup": None}
+        source = run.get("snapshot")
+        if source:
+            archive = directory / "snapshot.tar.gz"
+            arrived = self.client.download(f"/api/agent/snapshots/{source['id']}", archive)
+            if arrived != source["sha256"]:
+                raise PrepareError("the source snapshot does not match its checksum")
+            snapshot.extract(archive, directory / "src")
+            archive.unlink()
+            workdir = run.get("workdir") or "."
+            cwd = directory / "src" if workdir == "." else snapshot.safe_join(directory / "src", workdir)
+            if not cwd.is_dir():
+                raise PrepareError(f"the snapshot has no directory {workdir}")
+            spec["cwd"] = str(cwd)
+        if run.get("environment") == "uv":
+            uv = find_uv()
+            if not uv:
+                raise PrepareError("uv is not installed on this node")
+            spec["setup"] = {"command": [uv, "sync", "--locked"], "venv": str(directory / "venv")}
+        return spec
 
     def _refuse(self, key: str, job: int, attempt: int, reason: str) -> None:
         log.warning("refused attempt %s: %s", key, reason)
@@ -260,6 +365,7 @@ class Executor:
         del self.attempts[key]
         self.uploaded.pop(key, None)
         self.log_done.discard(key)
+        self.uploading.discard(key)
         self._save()
 
     # ---- processes ----

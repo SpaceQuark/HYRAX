@@ -29,7 +29,11 @@ public record Heartbeat(String node, String agentVersion, List<Gpu> gpus, List<A
 
     /** An attempt the node should be running. Starting it twice is harmless: the agent keys on (jobId, attempt). */
     public record Run(
-            long jobId, int attempt, List<String> command, Map<String, String> env, List<String> gpus, long freeMaxComputeMb) {}
+            long jobId, int attempt, List<String> command, Map<String, String> env, List<String> gpus, long freeMaxComputeMb,
+            Snapshot snapshot, String workdir, String environment, Map<String, String> datasets) {}
+
+    /** The source tree to run from. The agent fetches it by id and checks it against the hash. */
+    public record Snapshot(long id, String sha256) {}
 
     /**
      * The reply. {@code run}: attempts this node should be running. {@code cancel}: attempts to stop, including
