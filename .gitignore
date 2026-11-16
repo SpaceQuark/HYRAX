@@ -9,3 +9,5 @@ node_modules/
 *.log
 server/src/main/resources/static/
 deploy/.env
+# Design notes, audits and plans stay local.
+docs/
